@@ -10600,6 +10600,7 @@ static const struct file_operations btrfs_dir_file_operations = {
 #ifdef CONFIG_COMPAT
 	.compat_ioctl	= btrfs_compat_ioctl,
 #endif
+	.open		= btrfs_open_dir,
 	.release        = btrfs_release_file,
 	.fsync		= btrfs_sync_file,
 };

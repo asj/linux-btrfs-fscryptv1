@@ -1909,6 +1909,16 @@ out:
 	return num_written ? num_written : err;
 }
 
+int btrfs_open_dir(struct inode *inode, struct file *filp)
+{
+	return generic_file_open(inode, filp);
+}
+
+int btrfs_open_file(struct inode *inode, struct file *filp)
+{
+	return generic_file_open(inode, filp);
+}
+
 int btrfs_release_file(struct inode *inode, struct file *filp)
 {
 	if (filp->private_data)
@@ -3025,7 +3035,7 @@ const struct file_operations btrfs_file_operations = {
 	.splice_read	= generic_file_splice_read,
 	.write_iter	= btrfs_file_write_iter,
 	.mmap		= btrfs_file_mmap,
-	.open		= generic_file_open,
+	.open		= btrfs_open_file,
 	.release	= btrfs_release_file,
 	.fsync		= btrfs_sync_file,
 	.fallocate	= btrfs_fallocate,

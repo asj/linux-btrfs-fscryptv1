@@ -43,6 +43,8 @@
 #include <linux/uuid.h>
 #include <linux/btrfs.h>
 #include <linux/uaccess.h>
+#include <linux/fscrypt_supp.h>
+
 #include "ctree.h"
 #include "disk-io.h"
 #include "transaction.h"
@@ -2638,6 +2640,12 @@ static int btrfs_ioctl_defrag(struct file *file, void __user *argp)
 			}
 			/* compression requires us to start the IO */
 			if ((range->flags & BTRFS_DEFRAG_RANGE_COMPRESS)) {
+				/*
+				 * If we are getting request to encrypt during
+				 * defrag, deny it as of now.
+				 */
+				if (range->compress_type == BTRFS_ENCRYPT_FSCRYPTV1)
+					return -EOPNOTSUPP;
 				range->flags |= BTRFS_DEFRAG_RANGE_START_IO;
 				range->extent_thresh = (u32)-1;
 			}
@@ -5526,6 +5534,12 @@ long btrfs_ioctl(struct file *file, unsigned int
 		return btrfs_ioctl_setflags(file, argp);
 	case FS_IOC_GETVERSION:
 		return btrfs_ioctl_getversion(file, argp);
+	case FS_IOC_SET_ENCRYPTION_POLICY:
+		return fscrypt_ioctl_set_policy(file, argp);
+	case FS_IOC_GET_ENCRYPTION_PWSALT:
+		return -EOPNOTSUPP;
+	case FS_IOC_GET_ENCRYPTION_POLICY:
+		return fscrypt_ioctl_get_policy(file, argp);
 	case FITRIM:
 		return btrfs_ioctl_fitrim(file, argp);
 	case BTRFS_IOC_SNAP_CREATE:

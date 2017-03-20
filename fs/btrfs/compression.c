@@ -32,6 +32,7 @@
 #include <linux/writeback.h>
 #include <linux/bit_spinlock.h>
 #include <linux/slab.h>
+#include <linux/fscrypt_supp.h>
 #include "ctree.h"
 #include "disk-io.h"
 #include "transaction.h"
@@ -181,7 +182,7 @@ static void end_compressed_bio_read(struct bio *bio)
 				      cb->orig_bio,
 				      cb->compressed_len);
 csum_failed:
-	if (ret)
+	if (ret && ret != -ENOKEY)
 		cb->errors = 1;
 
 	/* release the compressed pages */
@@ -194,6 +195,9 @@ csum_failed:
 
 	/* do io completion on the original bio */
 	if (cb->errors) {
+		if (btrfs_encrypted_inode(inode))
+			fscrypt_release_ctx(bio->bi_private);
+
 		bio_io_error(cb->orig_bio);
 	} else {
 		int i;
@@ -763,14 +767,20 @@ static struct {
 static const struct btrfs_compress_op * const btrfs_compress_op[] = {
 	&btrfs_zlib_compress,
 	&btrfs_lzo_compress,
+	&btrfs_encrypt_ops,
 };
 
 void __init btrfs_init_compress(void)
 {
 	int i;
+	int type;
 
 	for (i = 0; i < BTRFS_COMPRESS_TYPES; i++) {
 		struct list_head *workspace;
+
+		type = i + 1;
+		if (type == BTRFS_ENCRYPT_FSCRYPTV1)
+			continue;
 
 		INIT_LIST_HEAD(&btrfs_comp_ws[i].idle_ws);
 		spin_lock_init(&btrfs_comp_ws[i].ws_lock);
@@ -809,6 +819,10 @@ static struct list_head *find_workspace(int type)
 	atomic_t *total_ws		= &btrfs_comp_ws[idx].total_ws;
 	wait_queue_head_t *ws_wait	= &btrfs_comp_ws[idx].ws_wait;
 	int *free_ws			= &btrfs_comp_ws[idx].free_ws;
+
+	if (type == BTRFS_ENCRYPT_FSCRYPTV1)
+		return NULL;
+
 again:
 	spin_lock(ws_lock);
 	if (!list_empty(idle_ws)) {
@@ -874,6 +888,9 @@ static void free_workspace(int type, struct list_head *workspace)
 	wait_queue_head_t *ws_wait	= &btrfs_comp_ws[idx].ws_wait;
 	int *free_ws			= &btrfs_comp_ws[idx].free_ws;
 
+	if (!workspace)
+		return;
+
 	spin_lock(ws_lock);
 	if (*free_ws < num_online_cpus()) {
 		list_add(workspace, idle_ws);
@@ -901,8 +918,12 @@ static void free_workspaces(void)
 {
 	struct list_head *workspace;
 	int i;
+	int type;
 
 	for (i = 0; i < BTRFS_COMPRESS_TYPES; i++) {
+		type = i + 1;
+		if (type == BTRFS_ENCRYPT_FSCRYPTV1)
+			continue;
 		while (!list_empty(&btrfs_comp_ws[i].idle_ws)) {
 			workspace = btrfs_comp_ws[i].idle_ws.next;
 			list_del(workspace);

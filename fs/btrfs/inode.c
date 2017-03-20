@@ -42,6 +42,7 @@
 #include <linux/blkdev.h>
 #include <linux/posix_acl_xattr.h>
 #include <linux/uio.h>
+#include <linux/fscrypt_supp.h>
 #include "ctree.h"
 #include "disk-io.h"
 #include "transaction.h"
@@ -207,10 +208,13 @@ static int insert_inline_extent(struct btrfs_trans_handle *trans,
 		}
 		btrfs_set_file_extent_compression(leaf, ei,
 						  compress_type);
+		if (compress_type == BTRFS_ENCRYPT_FSCRYPTV1)
+			btrfs_set_file_extent_encryption(leaf, ei, 1);
 	} else {
 		page = find_get_page(inode->i_mapping,
 				     start >> PAGE_SHIFT);
 		btrfs_set_file_extent_compression(leaf, ei, 0);
+		btrfs_set_file_extent_encryption(leaf, ei, 0);
 		kaddr = kmap_atomic(page);
 		offset = start & (PAGE_SIZE - 1);
 		write_extent_buffer(leaf, kaddr + offset, ptr, size);
@@ -386,6 +390,163 @@ static inline int inode_need_compress(struct inode *inode)
 	    BTRFS_I(inode)->force_compress)
 		return 1;
 	return 0;
+}
+
+static int btrfs_inline_extent_able(struct inode *inode,
+				u64 start, u64 end, size_t data_len)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	u64 isize = i_size_read(inode);
+	u64 actual_end = min(end + 1, isize);
+
+	if (start > 0 ||
+	    actual_end > root->fs_info->sectorsize ||
+	    data_len > BTRFS_MAX_INLINE_DATA_SIZE(root->fs_info) ||
+	    (!data_len &&
+	    (actual_end & (root->fs_info->sectorsize - 1)) == 0) ||
+	    end + 1 < isize ||
+	    data_len > root->fs_info->max_inline) {
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * In crypto bailout is only when its inevitable, in the long run we
+ * should merge this to compress_file_range() though.
+ */
+static noinline int encrypt_file_range(struct inode *inode,
+			struct page *locked_page, u64 start, u64 end,
+			struct async_cow *async_cow, int *num_added)
+{
+	int ret = 0;
+	u64 actual_end;
+        unsigned long offset;
+	unsigned long len = 0;
+	unsigned long nr_pages;
+	int may_inline_dont_align = -1; //fix for btrfs/035
+	struct page **pages = NULL;
+	unsigned long total_in = 0;
+	unsigned long ram_bytes = 0;
+	unsigned long total_out = 0;
+	unsigned long nr_pages_ret = 0;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	int encode_type = root->fs_info->compress_type;
+
+	if (BTRFS_I(inode)->force_compress)
+		encode_type = BTRFS_I(inode)->force_compress;
+
+	if ((end - start + 1) < SZ_16K &&
+	    (start > 0 || end + 1 < BTRFS_I(inode)->disk_i_size))
+		btrfs_add_inode_defrag(NULL, inode);
+
+	actual_end = min_t(u64, i_size_read(inode), end + 1);
+
+	/* fix for btrfs/073 */
+	if (actual_end < start)
+		actual_end = end + 1;
+
+again:
+	if (actual_end <= start)
+		return 0;
+
+	len = min_t(unsigned long, actual_end - start, SZ_128K);
+
+	nr_pages = (end >> PAGE_SHIFT) - (start >> PAGE_SHIFT) + 1;
+	nr_pages = min_t(unsigned long, nr_pages, SZ_128K / PAGE_SIZE);
+	pages = kcalloc(nr_pages, sizeof(struct page *), GFP_NOFS);
+	if (!pages) {
+		pr_err("BTRFS: Fatal: kcalloc for encrypt page list failed\n");
+		goto inevitable_bailout;
+	}
+
+	extent_range_clear_dirty_for_io(inode, start, end);
+
+	total_in = 0;
+	total_out = 0;
+	nr_pages_ret = 0;
+
+	if (len == actual_end)
+		may_inline_dont_align = btrfs_inline_extent_able(inode,
+							start, end, len);
+	else
+		may_inline_dont_align = 0;
+	ret = btrfs_compress_pages(encode_type, inode->i_mapping, start,
+				len, pages, nr_pages, &nr_pages_ret,
+				&total_in, &total_out, SZ_128K,
+				may_inline_dont_align);
+	if (ret) {
+		kfree(pages);
+		goto inevitable_bailout;
+	}
+
+	if (may_inline_dont_align) {
+
+		ret = cow_file_range_inline(root, inode, start, end,
+					total_out, encode_type, pages);
+
+		if (!ret) {
+			extent_clear_unlock_delalloc(inode, start, end, end,
+				NULL, EXTENT_DELALLOC | EXTENT_DEFRAG,
+				PAGE_UNLOCK | PAGE_CLEAR_DIRTY | PAGE_SET_WRITEBACK |
+				PAGE_END_WRITEBACK);
+			return 0;
+		}
+
+		if (ret < 0)
+			goto inevitable_bailout;
+	}
+
+	offset = total_out & (PAGE_SIZE - 1);
+	if (offset) {
+		pr_err("Entire page must be part of encrypt\n");
+		ASSERT(1);
+	}
+
+	ram_bytes = ALIGN(total_in, PAGE_SIZE);
+
+	ret = add_async_extent(async_cow, start, ram_bytes, total_out, pages,
+						nr_pages_ret, encode_type);
+	*num_added += 1;
+	if (start + total_in < end) {
+		start += total_in;
+		pages = NULL;
+		cond_resched();
+		goto again;
+	}
+
+	return ret;
+
+inevitable_bailout:
+	if (start == 0) {
+		ret = cow_file_range_inline(root, inode, start, end,
+					0, BTRFS_COMPRESS_NONE, NULL);
+		if (ret <= 0) {
+			unsigned long clear_flags = EXTENT_DELALLOC |
+							EXTENT_DEFRAG;
+			unsigned long page_error_op = PAGE_UNLOCK |
+				PAGE_CLEAR_DIRTY | PAGE_SET_WRITEBACK |
+				PAGE_END_WRITEBACK;
+
+			clear_flags |= (ret < 0) ? EXTENT_DO_ACCOUNTING : 0;
+			page_error_op |= (ret < 0) ? PAGE_SET_ERROR : 0;
+
+			extent_clear_unlock_delalloc(inode, start, end, end,
+						NULL, clear_flags, page_error_op);
+			return ret;
+		}
+	}
+	if (page_offset(locked_page) >= start &&
+				page_offset(locked_page) <= end)
+			__set_page_dirty_nobuffers(locked_page);
+
+	extent_range_redirty_for_io(inode, start, end);
+	ret = add_async_extent(async_cow, start, end - start + 1,
+				0, NULL, 0, BTRFS_COMPRESS_NONE);
+	*num_added += 1;
+
+	return ret;
 }
 
 /*
@@ -1105,12 +1266,26 @@ out_unlock:
 static noinline void async_cow_start(struct btrfs_work *work)
 {
 	struct async_cow *async_cow;
+	struct inode *inode;
 	int num_added = 0;
-	async_cow = container_of(work, struct async_cow, work);
+	int encode_type;
 
-	compress_file_range(async_cow->inode, async_cow->locked_page,
+	async_cow = container_of(work, struct async_cow, work);
+	inode = async_cow->inode;
+	encode_type = BTRFS_I(inode)->root->fs_info->compress_type;
+
+	if (BTRFS_I(inode)->force_compress)
+		encode_type = BTRFS_I(inode)->force_compress;
+
+	if (encode_type == BTRFS_ENCRYPT_FSCRYPTV1)
+		encrypt_file_range(async_cow->inode, async_cow->locked_page,
 			    async_cow->start, async_cow->end, async_cow,
 			    &num_added);
+	else
+		compress_file_range(async_cow->inode, async_cow->locked_page,
+			    async_cow->start, async_cow->end, async_cow,
+			    &num_added);
+
 	if (num_added == 0) {
 		btrfs_add_delayed_iput(async_cow->inode);
 		async_cow->inode = NULL;
@@ -5409,6 +5584,7 @@ void btrfs_evict_inode(struct inode *inode)
 no_delete:
 	btrfs_remove_delayed_node(inode);
 	clear_inode(inode);
+	fscrypt_put_encryption_info(inode, NULL);
 }
 
 /*
@@ -5853,6 +6029,12 @@ static int btrfs_real_readdir(struct file *file, struct dir_context *ctx)
 	if (!dir_emit_dots(file, ctx))
 		return 0;
 
+	if (btrfs_encrypted_inode(inode)) {
+		ret = fscrypt_get_encryption_info(inode);
+		if (ret && ret != -ENOKEY)
+			return ret;
+	}
+
 	path = btrfs_alloc_path();
 	if (!path)
 		return -ENOMEM;
@@ -6158,6 +6340,19 @@ static struct inode *btrfs_new_inode(struct btrfs_trans_handle *trans,
 	int nitems = name ? 2 : 1;
 	unsigned long ptr;
 	int ret;
+	int encrypt = 0;
+
+	if (dir && btrfs_encrypted_inode(dir) &&
+		(S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode))) {
+		ret = fscrypt_get_encryption_info(dir);
+		if (ret)
+			return ERR_PTR(ret);
+
+		if (!fscrypt_has_encryption_key(dir))
+			return ERR_PTR(-EPERM);
+
+		encrypt = 1;
+	}
 
 	path = btrfs_alloc_path();
 	if (!path)
@@ -6295,6 +6490,12 @@ static struct inode *btrfs_new_inode(struct btrfs_trans_handle *trans,
 		btrfs_err(fs_info,
 			  "error inheriting props for ino %llu (root %llu): %d",
 			  btrfs_ino(inode), root->root_key.objectid, ret);
+
+	if (encrypt) {
+		ret = fscrypt_inherit_context(dir, inode, trans, true);
+		if (ret)
+			goto fail_unlock;
+	}
 
 	return inode;
 
@@ -6788,6 +6989,12 @@ static noinline int uncompress_inline(struct btrfs_path *path,
 	max_size = min_t(unsigned long, PAGE_SIZE, max_size);
 	ret = btrfs_decompress(compress_type, tmp, page,
 			       extent_offset, inline_size, max_size);
+	/*
+	 * In case of nokey, decrypt will make sure encrypted pages
+	 * are returned
+	 */
+	if (ret && ret == -ENOKEY)
+		ret = 0;
 	kfree(tmp);
 	return ret;
 }

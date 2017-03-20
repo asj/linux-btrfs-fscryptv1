@@ -31,6 +31,7 @@
 #include <linux/slab.h>
 #include <linux/btrfs.h>
 #include <linux/uio.h>
+#include <linux/fscrypt_supp.h>
 #include "ctree.h"
 #include "disk-io.h"
 #include "transaction.h"
@@ -1911,11 +1912,29 @@ out:
 
 int btrfs_open_dir(struct inode *inode, struct file *filp)
 {
-	return generic_file_open(inode, filp);
+	int ret;
+
+	if (!btrfs_encrypted_inode(inode))
+		return generic_file_open(inode, filp);
+
+	ret = fscrypt_get_encryption_info(inode);
+
+	if (ret && ret != -ENOKEY && ret != -EKEYREVOKED)
+		return -EACCES;
+
+	return 0;
 }
 
 int btrfs_open_file(struct inode *inode, struct file *filp)
 {
+	if (btrfs_encrypted_inode(inode)) {
+		int ret;
+		ret = fscrypt_get_encryption_info(inode);
+		if (ret)
+			return -EACCES;
+		if (!fscrypt_has_encryption_key(inode))
+			return -ENOKEY;
+	}
 	return generic_file_open(inode, filp);
 }
 
@@ -2193,10 +2212,18 @@ static const struct vm_operations_struct btrfs_file_vm_ops = {
 static int btrfs_file_mmap(struct file	*filp, struct vm_area_struct *vma)
 {
 	struct address_space *mapping = filp->f_mapping;
+	struct inode *inode = mapping->host;
 
 	if (!mapping->a_ops->readpage)
 		return -ENOEXEC;
 
+	if (btrfs_encrypted_inode(inode)) {
+		int err = fscrypt_get_encryption_info(inode);
+		if (err)
+			return 0;
+		if (!fscrypt_has_encryption_key(inode))
+			return -ENOKEY;
+	}
 	file_accessed(filp);
 	vma->vm_ops = &btrfs_file_vm_ops;
 

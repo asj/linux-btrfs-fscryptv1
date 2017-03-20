@@ -17,6 +17,8 @@
  */
 
 #include <linux/hashtable.h>
+#include <linux/random.h>
+#include <linux/fscrypt_supp.h>
 #include "props.h"
 #include "btrfs_inode.h"
 #include "hash.h"
@@ -42,6 +44,12 @@ static int prop_compression_apply(struct inode *inode,
 				  size_t len);
 static const char *prop_compression_extract(struct inode *inode);
 
+
+static int prop_fscrypt_validate(const char *value, size_t len);
+static int prop_fscrypt_apply(struct inode *inode,
+				  const char *value, size_t len);
+static const char *prop_fscrypt_extract(struct inode *inode);
+
 static struct prop_handler prop_handlers[] = {
 	{
 		.xattr_name = XATTR_BTRFS_PREFIX "compression",
@@ -49,6 +57,13 @@ static struct prop_handler prop_handlers[] = {
 		.apply = prop_compression_apply,
 		.extract = prop_compression_extract,
 		.inheritable = 1
+	},
+	{
+		.xattr_name = XATTR_BTRFS_PREFIX "encrypt",
+		.validate = prop_fscrypt_validate,
+		.apply = prop_fscrypt_apply,
+		.extract = prop_fscrypt_extract,
+		.inheritable = 0
 	},
 };
 
@@ -135,7 +150,7 @@ static int __btrfs_set_prop(struct btrfs_trans_handle *trans,
 	if (ret)
 		return ret;
 	ret = handler->apply(inode, value, value_len);
-	if (ret) {
+	if (ret && ret != -EKEYREJECTED) {
 		__btrfs_setxattr(trans, inode, handler->xattr_name,
 				 NULL, 0, flags);
 		return ret;
@@ -143,7 +158,14 @@ static int __btrfs_set_prop(struct btrfs_trans_handle *trans,
 
 	set_bit(BTRFS_INODE_HAS_PROPS, &BTRFS_I(inode)->runtime_flags);
 
-	return 0;
+	return ret;
+}
+
+int btrfs_set_prop_trans(struct btrfs_trans_handle *trans, struct inode *inode,
+			const char *name, const char *value, size_t value_len,
+			int flags)
+{
+	return __btrfs_set_prop(trans, inode, name, value, value_len, flags);
 }
 
 int btrfs_set_prop(struct inode *inode,
@@ -276,13 +298,15 @@ static void inode_prop_iterator(void *ctx,
 	int ret;
 
 	ret = handler->apply(inode, value, len);
-	if (unlikely(ret))
-		btrfs_warn(root->fs_info,
+	if (unlikely(ret)) {
+		if (ret != -ENOKEY && ret != -EKEYREVOKED)
+			btrfs_warn(root->fs_info,
 			   "error applying prop %s to ino %llu (root %llu): %d",
 			   handler->xattr_name, btrfs_ino(inode),
 			   root->root_key.objectid, ret);
-	else
+	} else {
 		set_bit(BTRFS_INODE_HAS_PROPS, &BTRFS_I(inode)->runtime_flags);
+	}
 }
 
 int btrfs_load_inode_props(struct inode *inode, struct btrfs_path *path)
@@ -427,4 +451,20 @@ static const char *prop_compression_extract(struct inode *inode)
 	return NULL;
 }
 
+static int prop_fscrypt_validate(const char *value, size_t len)
+{
+	return 0;
+}
 
+static int prop_fscrypt_apply(struct inode *inode,
+				const char *value, size_t len)
+{
+	BTRFS_I(inode)->flags |= BTRFS_INODE_ENCRYPT;
+	return 0;
+}
+
+static const char *prop_fscrypt_extract(struct inode *inode)
+{
+	// Not used as inheritance is handled by fs/crypto
+	return NULL;
+}

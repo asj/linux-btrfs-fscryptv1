@@ -41,6 +41,7 @@
 #include <linux/slab.h>
 #include <linux/cleancache.h>
 #include <linux/ratelimit.h>
+#include <linux/fscrypt_supp.h>
 #include <linux/btrfs.h>
 #include "delayed-inode.h"
 #include "ctree.h"
@@ -1112,6 +1113,66 @@ static int get_default_subvol_objectid(struct btrfs_fs_info *fs_info, u64 *objec
 	return 0;
 }
 
+static int btrfs_get_context(struct inode *inode, void *ctx, size_t len)
+{
+	int ret;
+	ret =  __btrfs_getxattr(inode, "btrfs.encrypt", ctx, len);
+	return ret;
+}
+
+static int btrfs_prepare_context(struct inode *inode)
+{
+	return 0;
+}
+
+static int btrfs_set_context(struct inode *inode, const void *val,
+					size_t len, void *fs_data)
+{
+	int ret;
+
+	if (fs_data)
+		ret = btrfs_set_prop_trans(fs_data, inode,
+				"btrfs.encrypt", val, len, 0);
+	else
+		ret = btrfs_set_prop(inode, "btrfs.encrypt",
+				val, len, 0);
+
+	return ret;
+}
+
+static int btrfs_dummy_context(struct inode *inode)
+{
+	return 0;
+}
+
+bool btrfs_encrypted_inode(struct inode *inode)
+{
+	if (BTRFS_I(inode)->flags & BTRFS_INODE_ENCRYPT)
+		return true;
+	return false;
+}
+
+static bool btrfs_empty_dir(struct inode *inode)
+{
+	return true;
+}
+
+static unsigned btrfs_max_namelen(struct inode *inode)
+{
+	return 0;
+}
+
+static struct fscrypt_operations btrfs_fscryptops = {
+	.key_prefix		= NULL,
+	.get_context		= btrfs_get_context,
+	.prepare_context	= btrfs_prepare_context,
+	.set_context		= btrfs_set_context,
+	.dummy_context		= btrfs_dummy_context,
+	.is_encrypted		= btrfs_encrypted_inode,
+	.empty_dir		= btrfs_empty_dir,
+	.max_namelen		= btrfs_max_namelen,
+};
+
 static int btrfs_fill_super(struct super_block *sb,
 			    struct btrfs_fs_devices *fs_devices,
 			    void *data, int silent)
@@ -1133,6 +1194,8 @@ static int btrfs_fill_super(struct super_block *sb,
 #endif
 	sb->s_flags |= MS_I_VERSION;
 	sb->s_iflags |= SB_I_CGROUPWB;
+	sb->s_cop = &btrfs_fscryptops;
+
 	err = open_ctree(sb, fs_devices, (char *)data);
 	if (err) {
 		btrfs_err(fs_info, "open_ctree failed");

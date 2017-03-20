@@ -282,7 +282,7 @@ retry:
 	return 0;
 
 out:
-	if (res == -ENOKEY)
+	if (res == -ENOKEY || res == -EKEYREVOKED)
 		res = 0;
 	put_crypt_info(crypt_info);
 	kzfree(raw_key);

@@ -513,7 +513,7 @@ again:
 					   nr_pages, &nr_pages_ret,
 					   &total_in,
 					   &total_compressed,
-					   max_compressed);
+					   max_compressed, 0);
 
 		if (!ret) {
 			unsigned long offset = total_compressed &
